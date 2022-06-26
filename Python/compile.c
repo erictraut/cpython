@@ -383,6 +383,7 @@ struct compiler_unit {
 
     int u_firstlineno; /* the first lineno of the block */
     struct location u_loc;  /* line/column info of the current stmt */
+    int u_local_type_variables; /* true if currently using local __type_variables__ references */
 };
 
 /* This struct captures the global state of a compilation.
@@ -456,6 +457,7 @@ static int compiler_visit_keyword(struct compiler *, keyword_ty);
 static int compiler_visit_expr(struct compiler *, expr_ty);
 static int compiler_augassign(struct compiler *, stmt_ty);
 static int compiler_annassign(struct compiler *, stmt_ty);
+static int compiler_typealias(struct compiler *, stmt_ty);
 static int compiler_subscript(struct compiler *, expr_ty);
 static int compiler_slice(struct compiler *, expr_ty);
 
@@ -492,6 +494,13 @@ static int compiler_pattern(struct compiler *, pattern_ty, pattern_context *);
 static int compiler_match(struct compiler *, stmt_ty);
 static int compiler_pattern_subpattern(struct compiler *, pattern_ty,
                                        pattern_context *);
+
+static int compiler_load_typevars(struct compiler *);
+static int compiler_add_typeparams(struct compiler *, asdl_typeparam_seq *,
+                                   Py_ssize_t *n_outer_params);
+static int compiler_remove_typeparams(struct compiler *, asdl_typeparam_seq *);
+static int compiler_generate_generic_base_class(struct compiler *,
+                                                asdl_typeparam_seq *);
 
 static void clean_basic_block(basicblock *bb);
 
@@ -1105,6 +1114,8 @@ stack_effect(int opcode, int oparg, int jump)
             return -1;
         case IMPORT_FROM:
             return 1;
+        case LOAD_TYPEVARS:
+            return 1;
 
         /* Jumps */
         case JUMP_FORWARD:
@@ -1185,7 +1196,8 @@ stack_effect(int opcode, int oparg, int jump)
             return -2 - ((oparg & 0x01) != 0);
         case MAKE_FUNCTION:
             return 0 - ((oparg & 0x01) != 0) - ((oparg & 0x02) != 0) -
-                ((oparg & 0x04) != 0) - ((oparg & 0x08) != 0);
+                ((oparg & 0x04) != 0) - ((oparg & 0x08) != 0) -
+                ((oparg & 0x10) != 0);
         case BUILD_SLICE:
             if (oparg == 3)
                 return -2;
@@ -1835,6 +1847,8 @@ find_ann(asdl_stmt_seq *stmts)
         switch (st->kind) {
         case AnnAssign_kind:
             return 1;
+        case TypeAlias_kind:
+            return 0;
         case For_kind:
             res = find_ann(st->v.For.body) ||
                   find_ann(st->v.For.orelse);
@@ -2554,7 +2568,8 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     identifier name;
     asdl_expr_seq* decos;
     asdl_stmt_seq *body;
-    Py_ssize_t i, funcflags;
+    asdl_typeparam_seq *typeparams;
+    Py_ssize_t i, funcflags, outer_typeparams;
     int annotations;
     int scope_type;
     int firstlineno;
@@ -2562,6 +2577,7 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     if (is_async) {
         assert(s->kind == AsyncFunctionDef_kind);
 
+        typeparams = s->v.AsyncFunctionDef.typeparams;
         args = s->v.AsyncFunctionDef.args;
         returns = s->v.AsyncFunctionDef.returns;
         decos = s->v.AsyncFunctionDef.decorator_list;
@@ -2572,6 +2588,7 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     } else {
         assert(s->kind == FunctionDef_kind);
 
+        typeparams = s->v.FunctionDef.typeparams;
         args = s->v.FunctionDef.args;
         returns = s->v.FunctionDef.returns;
         decos = s->v.FunctionDef.decorator_list;
@@ -2594,6 +2611,10 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
 
     funcflags = compiler_default_arguments(c, args);
     if (funcflags == -1) {
+        return 0;
+    }
+
+    if (!compiler_add_typeparams(c, typeparams, &outer_typeparams)) {
         return 0;
     }
 
@@ -2634,6 +2655,17 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
         return 0;
     }
 
+    if (typeparams && asdl_seq_LEN(typeparams) > 0) {
+        if (!compiler_load_typevars(c)) {
+            return 0;
+        }
+        funcflags |= 0x10;
+
+        if (!compiler_remove_typeparams(c, typeparams)) {
+            return 0;
+        }
+    }
+
     if (!compiler_make_closure(c, co, funcflags, qualname)) {
         Py_DECREF(qualname);
         Py_DECREF(co);
@@ -2651,8 +2683,9 @@ static int
 compiler_class(struct compiler *c, stmt_ty s)
 {
     PyCodeObject *co;
-    int i, firstlineno;
+    int i, firstlineno, nargs;
     asdl_expr_seq *decos = s->v.ClassDef.decorator_list;
+    Py_ssize_t outer_typeparams;
 
     if (!compiler_decorators(c, decos))
         return 0;
@@ -2672,6 +2705,10 @@ compiler_class(struct compiler *c, stmt_ty s)
          <keywords> is the keyword arguments and **kwds argument
        This borrows from compiler_call.
     */
+
+    if (!compiler_add_typeparams(c, s->v.ClassDef.typeparams, &outer_typeparams)) {
+        return 0;
+    }
 
     /* 1. compile the class body into a code object */
     if (!compiler_enter_scope(c, s->v.ClassDef.name,
@@ -2698,6 +2735,16 @@ compiler_class(struct compiler *c, stmt_ty s)
         if (!compiler_nameop(c, &_Py_ID(__qualname__), Store)) {
             compiler_exit_scope(c);
             return 0;
+        }
+        /* Store the __type_variables__ attribute if there are active type variables */
+        if (c->u->u_ste->ste_typeparams && PyDict_Size(c->u->u_ste->ste_typeparams) > 0) {
+            if (!compiler_load_typevars(c)) {
+                return 0;
+            }
+            if (!compiler_nameop(c, &_Py_ID(__type_variables__), Store)) {
+                compiler_exit_scope(c);
+                return 0;
+            }
         }
         /* compile the body proper */
         if (!compiler_body(c, s->v.ClassDef.body)) {
@@ -2742,7 +2789,15 @@ compiler_class(struct compiler *c, stmt_ty s)
     ADDOP(c, LOAD_BUILD_CLASS);
 
     /* 3. load a function (or closure) made from the code object */
-    if (!compiler_make_closure(c, co, 0, NULL)) {
+    int funcflags = 0;
+    if (s->v.ClassDef.typeparams && asdl_seq_LEN(s->v.ClassDef.typeparams) > 0) {
+        if (!compiler_load_typevars(c)) {
+            return 0;
+        }
+        funcflags |= 0x10;
+    }
+
+    if (!compiler_make_closure(c, co, funcflags, NULL)) {
         Py_DECREF(co);
         return 0;
     }
@@ -2752,8 +2807,25 @@ compiler_class(struct compiler *c, stmt_ty s)
     ADDOP_LOAD_CONST(c, s->v.ClassDef.name);
 
     /* 5. generate the rest of the code for the call */
-    if (!compiler_call_helper(c, 2, s->v.ClassDef.bases, s->v.ClassDef.keywords))
+    nargs = 2;
+    if (s->v.ClassDef.typeparams && asdl_seq_LEN(s->v.ClassDef.typeparams) > 0) {
+        if (!compiler_generate_generic_base_class(
+                    c, s->v.ClassDef.typeparams)) {
+            return 0;
+        }
+        nargs++;
+    }
+
+    if (!compiler_call_helper(c, nargs, s->v.ClassDef.bases, s->v.ClassDef.keywords)) {
         return 0;
+    }
+
+    if (s->v.ClassDef.typeparams) {
+        if (!compiler_remove_typeparams(c, s->v.ClassDef.typeparams)) {
+            return 0;
+        }
+    }
+
     /* 6. apply decorators */
     if (!compiler_apply_decorators(c, decos))
         return 0;
@@ -4037,6 +4109,8 @@ compiler_visit_stmt(struct compiler *c, stmt_ty s)
         return compiler_augassign(c, s);
     case AnnAssign_kind:
         return compiler_annassign(c, s);
+    case TypeAlias_kind:
+        return compiler_typealias(c, s);
     case For_kind:
         return compiler_for(c, s);
     case While_kind:
@@ -4176,6 +4250,27 @@ addop_yield(struct compiler *c) {
 }
 
 static int
+compiler_load_typevars(struct compiler *c) {
+    if (c->u->u_local_type_variables) {
+        ADDOP_N(c, LOAD_FAST, &_Py_ID(__type_variables__), varnames);
+    } else {
+        ADDOP(c, LOAD_TYPEVARS);
+    }
+    return 1;
+}
+
+static int
+compiler_load_typevar(struct compiler * c, size_t index)
+{
+    if (!compiler_load_typevars(c)) {
+        return 0;
+    }
+    ADDOP_LOAD_CONST_NEW(c, PyLong_FromSize_t(index));
+    ADDOP(c, BINARY_SUBSCR)
+    return 1;
+}
+
+static int
 compiler_nameop(struct compiler *c, identifier name, expr_context_ty ctx)
 {
     int op, scope;
@@ -4188,6 +4283,16 @@ compiler_nameop(struct compiler *c, identifier name, expr_context_ty ctx)
     assert(!_PyUnicode_EqualToASCIIString(name, "None") &&
            !_PyUnicode_EqualToASCIIString(name, "True") &&
            !_PyUnicode_EqualToASCIIString(name, "False"));
+
+    if (c->u->u_ste->ste_typeparams && PyDict_Contains(c->u->u_ste->ste_typeparams, name)) {
+        assert(ctx == Load);
+        PyObject *tp_index = PyDict_GetItem(c->u->u_ste->ste_typeparams, name);
+        assert(tp_index != NULL);
+        if (!compiler_load_typevar(c, PyLong_AsSize_t(tp_index))) {
+            return 0;
+        }
+        return 1;
+    }
 
     if (forbidden_name(c, name, ctx))
         return 0;
@@ -5007,6 +5112,141 @@ compiler_call_simple_kw_helper(struct compiler *c,
     return 1;
 }
 
+// This function is temporary and should be deleted once
+// the typing symbols are converted from Python to C.
+static int
+compiler_generate_typing_import(struct compiler *c, identifier import_name)
+{
+    PyObject *names;
+
+    ADDOP_LOAD_CONST_NEW(c, PyLong_FromLong(0));
+    names = PyTuple_New(1);
+    if (!names)
+        return 0;
+
+    Py_INCREF(import_name);
+    PyTuple_SET_ITEM(names, 0, import_name);
+    ADDOP_LOAD_CONST_NEW(c, names);
+
+    ADDOP_NAME(c, IMPORT_NAME, &_Py_ID(typing), names);
+    ADDOP_NAME(c, IMPORT_FROM, import_name, names);
+
+    // Remove imported module but leave the import on top.
+    ADDOP_I(c, SWAP, 2);
+    ADDOP(c, POP_TOP);
+    return 1;
+}
+
+static int
+compiler_create_typevar(struct compiler *c, typeparam_ty t)
+{
+    identifier import_name;
+    identifier type_var_name;
+
+    // For now, simulate an import of TypeVar, ParamSpec or TypeVarTuple
+    // from the typing module. In the future, we may want to implement these
+    // types in C so we can avoid the import.
+
+    if (t->kind == TypeVar_kind) {
+        import_name = &_Py_ID(TypeVar);
+        type_var_name = t->v.TypeVar.name;
+    } else if (t->kind == TypeVarTuple_kind) {
+        import_name = &_Py_ID(TypeVarTuple);
+        type_var_name = t->v.TypeVarTuple.name;
+    } else {
+        assert(t->kind == ParamSpec_kind);
+        import_name = &_Py_ID(ParamSpec);
+        type_var_name = t->v.ParamSpec.name;
+    }
+
+    ADDOP(c, PUSH_NULL);
+    if (!compiler_generate_typing_import(c, import_name)) {
+        return 0;
+    }
+
+    ADDOP_LOAD_CONST(c, type_var_name);
+    ADDOP_I(c, BUILD_LIST, 1);
+
+    // If this is a TypeVar, we need to do additional work.
+    int eval_bound = false;
+    if (t->kind == TypeVar_kind) {
+        if (t->v.TypeVar.bound) {
+            // If a tuple expression is used here, it is a constrained
+            // TypeVar rather than a bound TypeVar.
+            if (t->v.TypeVar.bound->kind == Tuple_kind) {
+                VISIT(c, expr, t->v.TypeVar.bound);
+                ADDOP_I(c, LIST_EXTEND, 1)
+            } else {
+                eval_bound = true;
+            }
+        }
+    }
+
+    ADDOP(c, LIST_TO_TUPLE)
+
+    int nkwd = 0;
+
+    if (t->kind != TypeVarTuple_kind) {
+        // Add autovariance keyword argument.
+        ADDOP_LOAD_CONST(c, &_Py_ID(autovariance));
+        ADDOP_LOAD_CONST(c, Py_True);
+        nkwd++;
+
+        if (eval_bound) {
+            // Add bound keyword argument.
+            ADDOP_LOAD_CONST(c, &_Py_ID(bound));
+            VISIT(c, expr, t->v.TypeVar.bound);
+            nkwd++;
+        }
+
+        ADDOP_I(c, BUILD_MAP, nkwd);
+    }
+
+    ADDOP_I(c, CALL_FUNCTION_EX, nkwd > 0);
+
+    return 1;
+}
+
+/* Generates a Generic.__class_getitem__ call for type parameters */
+static int
+compiler_generate_generic_base_class(struct compiler *c,
+                                     asdl_typeparam_seq *typeparams)
+{
+    PySTEntryObject *ste = c->u->u_ste;
+    Py_ssize_t i, n, n_active_params;
+
+    n = asdl_seq_LEN(typeparams);
+    n_active_params = 0;
+
+    if (ste->ste_typeparams) {
+        n_active_params = PyDict_Size(ste->ste_typeparams);
+    }
+
+    // For now, simulate an import of Generic from the typing module.
+    // In the future, we may want to implement this type to avoid the import.
+    _Py_DECLARE_STR(generic, "Generic");
+    if (!compiler_generate_typing_import(c, &_Py_STR(generic))) {
+        return 0;
+    }
+
+    ADDOP_NAME(c, LOAD_METHOD, &_Py_ID(__class_getitem__), names);
+
+    for (i = 0; i < n; i++) {
+        if (!compiler_load_typevar(c, n_active_params - n + i)) {
+            return 0;
+        }
+
+        // If this is a TypeVarTuple, unpack it.
+        if (typeparams->typed_elements[i]->kind == TypeVarTuple_kind) {
+            ADDOP_I(c, UNPACK_SEQUENCE, 1);
+        }
+    }
+    
+    ADDOP_I(c, BUILD_TUPLE, n);
+
+    ADDOP_I(c, CALL, 1);
+    return 1;
+}
 
 /* shared code between compiler_call and compiler_class */
 static int
@@ -6063,6 +6303,168 @@ compiler_annassign(struct compiler *c, stmt_ty s)
     if (!s->v.AnnAssign.simple && !check_annotation(c, s)) {
         return 0;
     }
+    return 1;
+}
+
+static int
+compiler_typealias(struct compiler *c, stmt_ty s)
+{
+    Py_ssize_t i, n, n_outer_params;
+
+    ADDOP(c, PUSH_NULL);
+    ADDOP(c, PUSH_NULL);
+    if (!compiler_generate_typing_import(c, &_Py_ID(TypeAliasType))) {
+        return 0;
+    }
+    ADDOP_LOAD_CONST(c, s->v.TypeAlias.name);
+
+    // Allocate type parameters if this is a generic type alias.
+    if (!compiler_add_typeparams(c, s->v.TypeAlias.typeparams, &n_outer_params)) {
+        return 0;
+    }
+
+    n = asdl_seq_LEN(s->v.TypeAlias.typeparams);
+
+    for (i = 0; i < n; i++) {
+        if (!compiler_load_typevar(c, n_outer_params + i)) {
+            return 0;
+        }
+    }
+    ADDOP_I(c, BUILD_TUPLE, n);
+    ADDOP_I(c, CALL, 2);
+
+    // Save the TypeAlias so the value expression can refer to the type alias.
+    ADDOP_I(c, COPY, 1);
+    if (!compiler_nameop(c, s->v.TypeAlias.name, Store)) {
+        return 0;
+    }
+
+    // Store the active type parameters in a __type_variables__ attribute.
+    if (!compiler_load_typevars(c)) {
+        return 0;
+    }
+    ADDOP_I(c, COPY, 2);
+    ADDOP_NAME(c, STORE_ATTR, &_Py_ID(__type_variables__), names);
+
+    // Evaluate the value expression.
+    VISIT_IN_SCOPE(c, expr, s->v.TypeAlias.value);
+
+    if (s->v.TypeAlias.typeparams) {
+        if (!compiler_remove_typeparams(c, s->v.TypeAlias.typeparams)) {
+            return 0;
+        }
+    }
+
+    ADDOP_I(c, SWAP, 2);
+    ADDOP_NAME(c, STORE_ATTR, &_Py_ID(__value__), names);
+
+    return 1;
+}
+
+static identifier
+compiler_get_typeparam_name(typeparam_ty t) {
+    if (t->kind == TypeVar_kind) {
+        return t->v.TypeVar.name;
+    } else if (t->kind == TypeVarTuple_kind) {
+        return t->v.TypeVarTuple.name;
+    } else {
+        assert(t->kind == ParamSpec_kind);
+        return t->v.ParamSpec.name;
+    }
+}
+
+static int
+compiler_add_typeparams(struct compiler *c, asdl_typeparam_seq *typeparams,
+                        Py_ssize_t *n_outer_params)
+{
+    PySTEntryObject *ste = c->u->u_ste;
+    Py_ssize_t i, n_new_params;
+    typeparam_ty t;
+    identifier name;
+    PyObject *tp_index;
+
+    *n_outer_params = 0;
+    if (ste->ste_typeparams) {
+        *n_outer_params = PyDict_Size(ste->ste_typeparams);
+    }
+
+    n_new_params = asdl_seq_LEN(typeparams);
+
+    if (n_new_params > 0) {
+        // Note that all type parameter references will use the
+        // local variable __type_variables__ for accesses.
+        c->u->u_local_type_variables = 1;
+
+        if (!ste->ste_typeparams) {
+            ste->ste_typeparams = PyDict_New();
+            if (!ste->ste_typeparams)
+                return 0;
+        }
+
+        ADDOP_I(c, BUILD_LIST, 0);
+
+        if (n_outer_params > 0) {
+            ADDOP(c, LOAD_TYPEVARS);
+            ADDOP_I(c, LIST_EXTEND, 1);
+        }
+
+        for (i = 0; i < n_new_params; i++) {
+            t = (typeparam_ty)asdl_seq_GET(typeparams, i);
+            name = compiler_get_typeparam_name(t);
+
+            // Add the type parameter to the dictionary and give it
+            // an index that corresponds to the next entry.
+            tp_index = PyLong_FromSize_t(PyDict_GET_SIZE(ste->ste_typeparams));
+            if (!tp_index) {
+                return 0;
+            }
+            if (PyDict_SetItem(ste->ste_typeparams, name, tp_index) < 0) {
+                Py_DECREF(tp_index);
+                return 0;
+            }
+            Py_DECREF(tp_index);
+
+            // Construct the TypeVar-like object.
+            if (!compiler_create_typevar(c, typeparams->typed_elements[i])) {
+                return 0;
+            }
+
+            ADDOP_I(c, LIST_APPEND, 1);
+        }
+
+        ADDOP(c, LIST_TO_TUPLE);
+        ADDOP_N(c, STORE_FAST, &_Py_ID(__type_variables__), varnames);
+    }
+
+    return 1;
+}
+
+static int
+compiler_remove_typeparams(struct compiler *c, asdl_typeparam_seq *typeparams)
+{
+    PySTEntryObject *ste = c->u->u_ste;
+    int i, n_params;
+    typeparam_ty t;
+    identifier name;
+
+    assert(ste->ste_typeparams);
+
+    n_params = asdl_seq_LEN(typeparams);
+
+    if (n_params > 0) {
+        // Note that all type parameter references should use
+        // LOAD_TYPEVARS for accesses.
+        c->u->u_local_type_variables = 0;
+
+        for (i = 0; i < n_params; i++) {
+            t = (typeparam_ty)asdl_seq_GET(typeparams, i);
+            name = compiler_get_typeparam_name(t);
+            if (PyDict_DelItem(ste->ste_typeparams, name) < 0) {
+                return 0;
+            }
+        }
+    }
+
     return 1;
 }
 

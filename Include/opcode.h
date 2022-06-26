@@ -118,6 +118,7 @@ extern "C" {
 #define POP_JUMP_BACKWARD_IF_NONE              174
 #define POP_JUMP_BACKWARD_IF_FALSE             175
 #define POP_JUMP_BACKWARD_IF_TRUE              176
+#define LOAD_TYPEVARS                          177
 #define BINARY_OP_ADAPTIVE                       3
 #define BINARY_OP_ADD_FLOAT                      4
 #define BINARY_OP_ADD_INT                        5
@@ -186,10 +187,10 @@ extern "C" {
 #define STORE_SUBSCR_ADAPTIVE                  168
 #define STORE_SUBSCR_DICT                      169
 #define STORE_SUBSCR_LIST_INT                  170
-#define UNPACK_SEQUENCE_ADAPTIVE               177
-#define UNPACK_SEQUENCE_LIST                   178
-#define UNPACK_SEQUENCE_TUPLE                  179
-#define UNPACK_SEQUENCE_TWO_TUPLE              180
+#define UNPACK_SEQUENCE_ADAPTIVE               178
+#define UNPACK_SEQUENCE_LIST                   179
+#define UNPACK_SEQUENCE_TUPLE                  180
+#define UNPACK_SEQUENCE_TWO_TUPLE              181
 #define DO_TRACING                             255
 
 #define HAS_CONST(op) (false\

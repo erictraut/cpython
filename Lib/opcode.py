@@ -198,6 +198,8 @@ jrel_op('POP_JUMP_BACKWARD_IF_NONE', 174)
 jrel_op('POP_JUMP_BACKWARD_IF_FALSE', 175)
 jrel_op('POP_JUMP_BACKWARD_IF_TRUE', 176)
 
+def_op('LOAD_TYPEVARS', 177)
+
 
 del def_op, name_op, jrel_op, jabs_op
 

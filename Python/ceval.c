@@ -5407,6 +5407,14 @@ handle_eval_breaker:
                 assert(PyTuple_CheckExact(TOP()));
                 func->func_closure = POP();
             }
+            if (oparg & 0x10) {
+                assert(PyTuple_CheckExact(TOP()));
+                func->func_typevars = POP();
+            } else {
+                PyObject *typevars = frame->f_func->func_typevars;
+                Py_XINCREF(typevars);
+                func->func_typevars = typevars;
+            }
             if (oparg & 0x04) {
                 assert(PyTuple_CheckExact(TOP()));
                 func->func_annotations = POP();
@@ -5604,6 +5612,20 @@ handle_eval_breaker:
 
         TARGET(CACHE) {
             Py_UNREACHABLE();
+        }
+
+        TARGET(LOAD_TYPEVARS) {
+            PyObject *typevars = frame->f_func->func_typevars;
+            if (typevars) {
+                Py_INCREF(typevars);
+            } else {
+                typevars = PyTuple_New(0);
+                if (typevars == NULL) {
+                    goto error;
+                }
+            }
+            PUSH(typevars);
+            DISPATCH();
         }
 
 #if USE_COMPUTED_GOTOS
