@@ -667,6 +667,7 @@ extern "C" {
                 INIT_STR(dot, "."), \
                 INIT_STR(dot_locals, ".<locals>"), \
                 INIT_STR(empty, ""), \
+                INIT_STR(generic, "Generic"), \
                 INIT_STR(list_err, "list index out of range"), \
                 INIT_STR(newline, "\n"), \
                 INIT_STR(open_br, "{"), \
@@ -675,9 +676,14 @@ extern "C" {
             }, \
             .identifiers = { \
                 INIT_ID(False), \
+                INIT_ID(ParamSpec), \
                 INIT_ID(Py_Repr), \
                 INIT_ID(TextIOWrapper), \
                 INIT_ID(True), \
+                INIT_ID(TypeAliasType), \
+                INIT_ID(TypeParameter), \
+                INIT_ID(TypeVar), \
+                INIT_ID(TypeVarTuple), \
                 INIT_ID(WarningMessage), \
                 INIT_ID(_), \
                 INIT_ID(__IOBase_closed), \
@@ -828,6 +834,7 @@ extern "C" {
                 INIT_ID(__typing_prepare_subst__), \
                 INIT_ID(__typing_subst__), \
                 INIT_ID(__typing_unpacked_tuple_args__), \
+                INIT_ID(__value__), \
                 INIT_ID(__warningregistry__), \
                 INIT_ID(__weaklistoffset__), \
                 INIT_ID(__weakref__), \
@@ -969,6 +976,7 @@ extern "C" {
                 INIT_ID(throw), \
                 INIT_ID(top), \
                 INIT_ID(truncate), \
+                INIT_ID(typing), \
                 INIT_ID(unraisablehook), \
                 INIT_ID(values), \
                 INIT_ID(version), \

@@ -39,6 +39,7 @@ struct symtable {
                                        the symbol table */
     int recursion_depth;            /* current recursion depth */
     int recursion_limit;            /* recursion limit */
+    PyObject *st_typeparams;        /* set: active type parameters */
 };
 
 typedef struct _symtable_entry {
@@ -102,6 +103,7 @@ extern void _PySymtable_Free(struct symtable *);
 #define DEF_IMPORT 2<<6        /* assignment occurred via import */
 #define DEF_ANNOT 2<<7         /* this name is annotated */
 #define DEF_COMP_ITER 2<<8     /* this name is a comprehension iteration variable */
+#define DEF_TYPEPARAM 2<<9     /* type parameter */
 
 #define DEF_BOUND (DEF_LOCAL | DEF_PARAM | DEF_IMPORT)
 
@@ -117,6 +119,7 @@ extern void _PySymtable_Free(struct symtable *);
 #define GLOBAL_IMPLICIT 3
 #define FREE 4
 #define CELL 5
+#define TYPEPARAM 6
 
 #define GENERATOR 1
 #define GENERATOR_EXPRESSION 2

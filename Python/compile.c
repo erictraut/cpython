@@ -456,6 +456,7 @@ static int compiler_visit_keyword(struct compiler *, keyword_ty);
 static int compiler_visit_expr(struct compiler *, expr_ty);
 static int compiler_augassign(struct compiler *, stmt_ty);
 static int compiler_annassign(struct compiler *, stmt_ty);
+static int compiler_typealias(struct compiler *, stmt_ty);
 static int compiler_subscript(struct compiler *, expr_ty);
 static int compiler_slice(struct compiler *, expr_ty);
 
@@ -471,10 +472,12 @@ static int compiler_call_simple_kw_helper(struct compiler *c,
                                           Py_ssize_t nkwelts);
 static int compiler_call_helper(struct compiler *c, int n,
                                 asdl_expr_seq *args,
-                                asdl_keyword_seq *keywords);
+                                asdl_keyword_seq *keywords,
+                                asdl_typeparam_seq *typeparams);
 static int compiler_try_except(struct compiler *, stmt_ty);
 static int compiler_try_star_except(struct compiler *, stmt_ty);
 static int compiler_set_qualname(struct compiler *);
+static int compiler_create_typeparam(struct compiler *, identifier);
 
 static int compiler_sync_comprehension_generator(
                                       struct compiler *c,
@@ -1835,6 +1838,8 @@ find_ann(asdl_stmt_seq *stmts)
         switch (st->kind) {
         case AnnAssign_kind:
             return 1;
+        case TypeAlias_kind:
+            return 0;
         case For_kind:
             res = find_ann(st->v.For.body) ||
                   find_ann(st->v.For.orelse);
@@ -2752,8 +2757,10 @@ compiler_class(struct compiler *c, stmt_ty s)
     ADDOP_LOAD_CONST(c, s->v.ClassDef.name);
 
     /* 5. generate the rest of the code for the call */
-    if (!compiler_call_helper(c, 2, s->v.ClassDef.bases, s->v.ClassDef.keywords))
+    if (!compiler_call_helper(c, 2, s->v.ClassDef.bases, 
+            s->v.ClassDef.keywords, s->v.ClassDef.typeparams))
         return 0;
+
     /* 6. apply decorators */
     if (!compiler_apply_decorators(c, decos))
         return 0;
@@ -4037,6 +4044,8 @@ compiler_visit_stmt(struct compiler *c, stmt_ty s)
         return compiler_augassign(c, s);
     case AnnAssign_kind:
         return compiler_annassign(c, s);
+    case TypeAlias_kind:
+        return compiler_typealias(c, s);
     case For_kind:
         return compiler_for(c, s);
     case While_kind:
@@ -4219,6 +4228,9 @@ compiler_nameop(struct compiler *c, identifier name, expr_context_ty ctx)
     case GLOBAL_EXPLICIT:
         optype = OP_GLOBAL;
         break;
+    case TYPEPARAM:
+        assert(ctx == Load);
+        return compiler_create_typeparam(c, name);
     default:
         /* scope can be 0 */
         break;
@@ -4862,7 +4874,8 @@ compiler_call(struct compiler *c, expr_ty e)
     VISIT(c, expr, e->v.Call.func);
     return compiler_call_helper(c, 0,
                                 e->v.Call.args,
-                                e->v.Call.keywords);
+                                e->v.Call.keywords,
+                                NULL);
 }
 
 static int
@@ -5007,13 +5020,114 @@ compiler_call_simple_kw_helper(struct compiler *c,
     return 1;
 }
 
+static int
+compiler_generate_typing_import(struct compiler *c, identifier import_name)
+{
+    PyObject *names;
+
+    ADDOP_LOAD_CONST_NEW(c, PyLong_FromLong(0));
+    names = PyTuple_New(1);
+    if (!names)
+        return 0;
+
+    Py_INCREF(import_name);
+    PyTuple_SET_ITEM(names, 0, import_name);
+    ADDOP_LOAD_CONST_NEW(c, names);
+
+    ADDOP_NAME(c, IMPORT_NAME, &_Py_ID(typing), names);
+    ADDOP_NAME(c, IMPORT_FROM, import_name, names);
+
+    // Remove imported module but leave the import on top.
+    ADDOP_I(c, SWAP, 2);
+    ADDOP(c, POP_TOP);
+    return 1;
+}
+
+static int
+compiler_create_typeparam(struct compiler *c, identifier name)
+{
+    ADDOP(c, PUSH_NULL);
+    if (!compiler_generate_typing_import(c, &_Py_ID(TypeParameter))) {
+        return 0;
+    }
+
+    // Call the constructor.
+    ADDOP_LOAD_CONST(c, name);
+    ADDOP_I(c, CALL, 1);
+
+    return 1;
+}
+
+static int
+compiler_create_typevar_like(struct compiler *c, typeparam_ty t)
+{
+    identifier import_name;
+    identifier type_var_name;
+
+    // For now, simulate an import of TypeVar, ParamSpec or TypeVarTuple
+    // from the typing module. In the future, we may want to implement these
+    // types in C so we can avoid the import.
+
+    if (t->kind == TypeVar_kind) {
+        import_name = &_Py_ID(TypeVar);
+        type_var_name = t->v.TypeVar.name;
+    } else if (t->kind == TypeVarTuple_kind) {
+        import_name = &_Py_ID(TypeVarTuple);
+        type_var_name = t->v.TypeVarTuple.name;
+    } else {
+        assert(t->kind == ParamSpec_kind);
+        import_name = &_Py_ID(ParamSpec);
+        type_var_name = t->v.ParamSpec.name;
+    }
+
+    ADDOP(c, PUSH_NULL);
+    if (!compiler_generate_typing_import(c, import_name)) {
+        return 0;
+    }
+
+    // Call the constructor.
+    ADDOP_LOAD_CONST(c, type_var_name);
+    ADDOP_I(c, CALL, 1);
+
+    return 1;
+}
+
+/* Generates a Generic.__class_getitem__ call for type parameters */
+static int
+compiler_generate_generic_base_class(struct compiler *c,
+                                     asdl_typeparam_seq *typeparams)
+{
+    Py_ssize_t i, n;
+
+    // For now, simulate an import of Generic from the typing module.
+    // In the future, we may want to implement this type to avoid the import.
+    _Py_DECLARE_STR(generic, "Generic");
+    if (!compiler_generate_typing_import(c, &_Py_STR(generic))) {
+        return 0;
+    }
+
+    ADDOP_NAME(c, LOAD_METHOD, &_Py_ID(__class_getitem__), names);
+
+    n = asdl_seq_LEN(typeparams);
+    for (i = 0; i < n; i++) {
+        if (!compiler_create_typevar_like(c, typeparams->typed_elements[i])) {
+            return 0;
+        }
+    }
+    
+    ADDOP_I(c, BUILD_TUPLE, n);
+
+    ADDOP_I(c, CALL, 1);
+    return 1;
+}
 
 /* shared code between compiler_call and compiler_class */
 static int
 compiler_call_helper(struct compiler *c,
                      int n, /* Args already pushed */
                      asdl_expr_seq *args,
-                     asdl_keyword_seq *keywords)
+                     asdl_keyword_seq *keywords,
+                     asdl_typeparam_seq *typeparams)
 {
     Py_ssize_t i, nseen, nelts, nkwelts;
 
@@ -5046,6 +5160,12 @@ compiler_call_helper(struct compiler *c,
         assert(elt->kind != Starred_kind);
         VISIT(c, expr, elt);
     }
+    if (typeparams) {
+        if (!compiler_generate_generic_base_class(c, typeparams)) {
+            return 0;
+        }
+        nelts++;
+    }
     if (nkwelts) {
         VISIT_SEQ(c, keyword, keywords);
         if (!compiler_call_simple_kw_helper(c, keywords, nkwelts)) {
@@ -5058,12 +5178,23 @@ compiler_call_helper(struct compiler *c,
 ex_call:
 
     /* Do positional arguments. */
-    if (n ==0 && nelts == 1 && ((expr_ty)asdl_seq_GET(args, 0))->kind == Starred_kind) {
+    if (n == 0 && nelts == 1 && !typeparams &&
+            ((expr_ty)asdl_seq_GET(args, 0))->kind == Starred_kind) {
         VISIT(c, expr, ((expr_ty)asdl_seq_GET(args, 0))->v.Starred.value);
     }
-    else if (starunpack_helper(c, args, n, BUILD_LIST,
-                                 LIST_APPEND, LIST_EXTEND, 1) == 0) {
-        return 0;
+    else {
+        if (starunpack_helper(c, args, n, BUILD_LIST,
+                                 LIST_APPEND, LIST_EXTEND, 0) == 0) {
+            return 0;
+        }
+        if (typeparams) {
+            if (!compiler_generate_generic_base_class(c, typeparams)) {
+                return 0;
+            }
+            ADDOP_I(c, LIST_APPEND, 1);
+            nelts++;
+        }
+        ADDOP(c, LIST_TO_TUPLE);
     }
     /* Then keyword arguments */
     if (nkwelts) {
@@ -6063,6 +6194,43 @@ compiler_annassign(struct compiler *c, stmt_ty s)
     if (!s->v.AnnAssign.simple && !check_annotation(c, s)) {
         return 0;
     }
+    return 1;
+}
+
+static int
+compiler_typealias(struct compiler *c, stmt_ty s)
+{
+    Py_ssize_t i, n;
+    asdl_typeparam_seq *typeparams;
+
+    ADDOP(c, PUSH_NULL);
+    if (!compiler_generate_typing_import(c, &_Py_ID(TypeAliasType))) {
+        return 0;
+    }
+    ADDOP_LOAD_CONST(c, s->v.TypeAlias.name);
+
+    typeparams = s->v.TypeAlias.typeparams;
+    n = asdl_seq_LEN(typeparams);
+    for (i = 0; i < n; i++) {
+        if (!compiler_create_typevar_like(c, typeparams->typed_elements[i])) {
+            return 0;
+        }
+    }
+    
+    ADDOP_I(c, BUILD_TUPLE, n);
+    ADDOP_I(c, CALL, 2);
+    ADDOP_I(c, COPY, 1);
+
+    // Save the TypeAlias so the value expression can refer to the type alias.
+    if (!compiler_nameop(c, s->v.TypeAlias.name, Store)) {
+        return 0;
+    }
+
+    VISIT_IN_SCOPE(c, expr, s->v.TypeAlias.value);
+
+    ADDOP_I(c, SWAP, 2);
+    ADDOP_NAME(c, STORE_ATTR, &_Py_ID(__value__), names);
+
     return 1;
 }
 
