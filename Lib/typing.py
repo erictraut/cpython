@@ -998,6 +998,9 @@ class TypeParameter(_Final, _Immutable, _PickleUsingNameMixin, _root=True):
         self.__name__ = name
         super().__init__()
 
+    def __iter__(self):
+        yield Unpack[self]
+
     def __or__(self, right):
         return Union[self, right]
 

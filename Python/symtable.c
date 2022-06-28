@@ -63,12 +63,6 @@
 #define TYPEPARAM_STORE \
 "cannot overwrite type parameter '%U'"
 
-#define TYPEPARAM_DUPLICATE \
-"name '%U' is already in use as a local variable"
-
-#define TYPEPARAM_OUT_OF_SCOPE \
-"type parameter '%U' is not in scope"
-
 
 #define LOCATION(x) \
  (x)->lineno, (x)->col_offset, (x)->end_lineno, (x)->end_col_offset
@@ -103,6 +97,7 @@ ste_new(struct symtable *st, identifier name, _Py_block_ty block,
     ste->ste_children = NULL;
 
     ste->ste_directives = NULL;
+    ste->ste_typeparams = NULL;
 
     ste->ste_type = block;
     ste->ste_nested = 0;
@@ -164,6 +159,7 @@ ste_dealloc(PySTEntryObject *ste)
     Py_XDECREF(ste->ste_varnames);
     Py_XDECREF(ste->ste_children);
     Py_XDECREF(ste->ste_directives);
+    Py_XDECREF(ste->ste_typeparams);
     PyObject_Free(ste);
 }
 
@@ -270,8 +266,6 @@ symtable_new(void)
     if ((st->st_stack = PyList_New(0)) == NULL)
         goto fail;
     if ((st->st_blocks = PyDict_New()) == NULL)
-        goto fail;
-    if ((st->st_typeparams = PySet_New(NULL)) == NULL)
         goto fail;
     st->st_cur = NULL;
     st->st_private = NULL;
@@ -388,7 +382,6 @@ _PySymtable_Free(struct symtable *st)
     Py_XDECREF(st->st_filename);
     Py_XDECREF(st->st_blocks);
     Py_XDECREF(st->st_stack);
-    Py_XDECREF(st->st_typeparams);
     PyMem_Free((void *)st);
 }
 
@@ -454,6 +447,43 @@ error_at_directive(PySTEntryObject *ste, PyObject *name)
     PyErr_SetString(PyExc_RuntimeError,
                     "BUG: internal directive bookkeeping broken");
     return 0;
+}
+
+static int
+symtable_add_typeparam(PySTEntryObject *ste, identifier name)
+{
+    if (!ste->ste_typeparams) {
+        ste->ste_typeparams = PySet_New(NULL);
+        if (!ste->ste_typeparams)
+            return 0;
+    }
+
+    if (PySet_Add(ste->ste_typeparams, name) < 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int
+symtable_remove_typeparam(PySTEntryObject *ste, identifier name)
+{
+    assert(ste->ste_typeparams);
+
+    if (PySet_Discard(ste->ste_typeparams, name) < 0) {
+        return 0;
+    }
+
+    return 1;
+}
+
+static int
+symtable_is_typeparam(PySTEntryObject *ste, identifier name)
+{
+    if (!ste->ste_typeparams)
+        return 0;
+    
+    return PySet_Contains(ste->ste_typeparams, name);
 }
 
 
@@ -525,8 +555,7 @@ analyze_name(PySTEntryObject *ste, PyObject *scopes, PyObject *name, long flags,
              PyObject *bound, PyObject *local, PyObject *free,
              PyObject *global)
 {
-    if (flags & DEF_TYPEPARAM) {
-        SET_SCOPE(scopes, name, TYPEPARAM);
+    if (symtable_is_typeparam(ste, name)) {
         return 1;
     }
     if (flags & DEF_GLOBAL) {
@@ -1017,6 +1046,17 @@ symtable_enter_block(struct symtable *st, identifier name, _Py_block_ty block,
     Py_DECREF(ste);
     st->st_cur = ste;
 
+    /* Copy the active type parameters from the previous scope. */
+    if (prev && prev->ste_typeparams) {
+        PyObject *key;
+        Py_ssize_t pos = 0;
+        Py_hash_t hash;
+
+        while (_PySet_NextEntry(prev->ste_typeparams, &pos, &key, &hash)) {
+            symtable_add_typeparam(ste, key);
+        }
+    }
+
     /* Annotation blocks shouldn't have any affect on the symbol table since in
      * the compilation stage, they will all be transformed to strings. They are
      * only created if future 'annotations' feature is activated. */
@@ -1055,7 +1095,6 @@ symtable_add_def_helper(struct symtable *st, PyObject *name, int flag, struct _s
     long val;
     PyObject *mangled = _Py_Mangle(st->st_private, name);
 
-
     if (!mangled)
         return 0;
     dict = ste->ste_symbols;
@@ -1068,22 +1107,6 @@ symtable_add_def_helper(struct symtable *st, PyObject *name, int flag, struct _s
                                              lineno, col_offset + 1,
                                              end_lineno, end_col_offset + 1);
             goto error;
-        }
-        if (flag & DEF_TYPEPARAM) {
-            if (!(val & DEF_TYPEPARAM)) {
-                PyErr_Format(PyExc_SyntaxError, TYPEPARAM_DUPLICATE, name);
-                PyErr_RangedSyntaxLocationObject(st->st_filename,
-                                                lineno, col_offset + 1,
-                                                end_lineno, end_col_offset + 1);
-                goto error;
-            }
-            if (!PySet_Contains(st->st_typeparams, name)) {
-                PyErr_Format(PyExc_SyntaxError, TYPEPARAM_OUT_OF_SCOPE, name);
-                PyErr_RangedSyntaxLocationObject(st->st_filename,
-                                                lineno, col_offset + 1,
-                                                end_lineno, end_col_offset + 1);
-                goto error;
-            }
         }
         val |= flag;
     }
@@ -1240,13 +1263,13 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
     case FunctionDef_kind:
         if (!symtable_add_def(st, s->v.FunctionDef.name, DEF_LOCAL, LOCATION(s)))
             VISIT_QUIT(st, 0);
+        if (s->v.FunctionDef.args->defaults)
+            VISIT_SEQ(st, expr, s->v.FunctionDef.args->defaults);
         if (s->v.FunctionDef.typeparams != NULL &&
             !symtable_enter_typeparam_block(st,
                 (void *)s->v.FunctionDef.typeparams)) {
             VISIT_QUIT(st, 0);
         }
-        if (s->v.FunctionDef.args->defaults)
-            VISIT_SEQ(st, expr, s->v.FunctionDef.args->defaults);
         if (s->v.FunctionDef.args->kw_defaults)
             VISIT_SEQ_WITH_NULL(st, expr, s->v.FunctionDef.args->kw_defaults);
         if (!symtable_visit_annotations(st, s, s->v.FunctionDef.args,
@@ -1530,13 +1553,13 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
     case AsyncFunctionDef_kind:
         if (!symtable_add_def(st, s->v.AsyncFunctionDef.name, DEF_LOCAL, LOCATION(s)))
             VISIT_QUIT(st, 0);
+        if (s->v.AsyncFunctionDef.args->defaults)
+            VISIT_SEQ(st, expr, s->v.AsyncFunctionDef.args->defaults);
         if (s->v.AsyncFunctionDef.typeparams != NULL &&
             !symtable_enter_typeparam_block(st,
                 (void *)s->v.AsyncFunctionDef.typeparams)) {
             VISIT_QUIT(st, 0);
         }
-        if (s->v.AsyncFunctionDef.args->defaults)
-            VISIT_SEQ(st, expr, s->v.AsyncFunctionDef.args->defaults);
         if (s->v.AsyncFunctionDef.args->kw_defaults)
             VISIT_SEQ_WITH_NULL(st, expr,
                                 s->v.AsyncFunctionDef.args->kw_defaults);
@@ -1813,15 +1836,12 @@ symtable_visit_expr(struct symtable *st, expr_ty e)
             VISIT(st, expr, e->v.Slice.step)
         break;
     case Name_kind:
-        if (PySet_Contains(st->st_typeparams, e->v.Name.id)) {
+        if (symtable_is_typeparam(st->st_cur, e->v.Name.id)) {
             if (e->v.Name.ctx != Load) {
                 PyErr_Format(PyExc_SyntaxError,
                         e->v.Name.ctx == Del ? TYPEPARAM_DEL : TYPEPARAM_STORE,
                         e->v.Name.id);
                 PyErr_RangedSyntaxLocationObject(st->st_filename, LOCATION(e));
-                VISIT_QUIT(st, 0);
-            }
-            if (!symtable_add_def(st, e->v.Name.id, DEF_TYPEPARAM, LOCATION(e))) {
                 VISIT_QUIT(st, 0);
             }
             break;
@@ -2270,7 +2290,7 @@ symtable_enter_typeparam_block(struct symtable *st,
         typeparam_ty t = (typeparam_ty)asdl_seq_GET(type_params, i);
 
         name = symtable_typeparam_name(t);
-        if (PySet_Contains(st->st_typeparams, name)) {
+        if (symtable_is_typeparam(st->st_cur, name)) {
             PyErr_Format(PyExc_SyntaxError,
                         "duplicate type parameter '%S'", name);
             PyErr_RangedSyntaxLocationObject(st->st_filename,
@@ -2281,11 +2301,7 @@ symtable_enter_typeparam_block(struct symtable *st,
             return 0;
         }
 
-        if (PySet_Add(st->st_typeparams, name) < 0) {
-            return 0;
-        }
-
-        if (!symtable_add_def(st, name, DEF_TYPEPARAM, LOCATION(t))) {
+        if (!symtable_add_typeparam(st->st_cur, name)) {
             return 0;
         }
     }
@@ -2304,7 +2320,7 @@ symtable_exit_typeparam_block(struct symtable *st,
     for (i = 0; i < asdl_seq_LEN(type_params); i++) {
         t = (typeparam_ty)asdl_seq_GET(type_params, i);
         name = symtable_typeparam_name(t);
-        if (PySet_Discard(st->st_typeparams, name) < 0) {
+        if (!symtable_remove_typeparam(st->st_cur, name)) {
             return 0;
         }
     }

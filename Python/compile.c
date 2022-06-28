@@ -650,6 +650,64 @@ compiler_free(struct compiler *c)
     Py_DECREF(c->c_stack);
 }
 
+identifier
+get_typeparam_name(typeparam_ty t) {
+    if (t->kind == TypeVar_kind) {
+        return t->v.TypeVar.name;
+    } else if (t->kind == TypeVarTuple_kind) {
+        return t->v.TypeVarTuple.name;
+    } else {
+        assert(t->kind == ParamSpec_kind);
+        return t->v.ParamSpec.name;
+    }
+}
+
+static int
+compiler_add_typeparams(struct compiler *c, asdl_typeparam_seq *typeparams)
+{
+    PySTEntryObject *ste = c->u->u_ste;
+    int i;
+    typeparam_ty t;
+    identifier name;
+
+    if (!ste->ste_typeparams) {
+        ste->ste_typeparams = PySet_New(NULL);
+        if (!ste->ste_typeparams)
+            return 0;
+    }
+
+    for (i = 0; i < asdl_seq_LEN(typeparams); i++) {
+        t = (typeparam_ty)asdl_seq_GET(typeparams, i);
+        name = get_typeparam_name(t);
+        if (PySet_Add(ste->ste_typeparams, name) < 0) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+static int
+compiler_remove_typeparams(struct compiler *c, asdl_typeparam_seq *typeparams)
+{
+    PySTEntryObject *ste = c->u->u_ste;
+    int i;
+    typeparam_ty t;
+    identifier name;
+
+    assert(ste->ste_typeparams);
+
+    for (i = 0; i < asdl_seq_LEN(typeparams); i++) {
+        t = (typeparam_ty)asdl_seq_GET(typeparams, i);
+        name = get_typeparam_name(t);
+        if (PySet_Discard(ste->ste_typeparams, name) < 0) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 static PyObject *
 list2dict(PyObject *list)
 {
@@ -2559,6 +2617,7 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     identifier name;
     asdl_expr_seq* decos;
     asdl_stmt_seq *body;
+    asdl_typeparam_seq *typeparams;
     Py_ssize_t i, funcflags;
     int annotations;
     int scope_type;
@@ -2567,6 +2626,7 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     if (is_async) {
         assert(s->kind == AsyncFunctionDef_kind);
 
+        typeparams = s->v.AsyncFunctionDef.typeparams;
         args = s->v.AsyncFunctionDef.args;
         returns = s->v.AsyncFunctionDef.returns;
         decos = s->v.AsyncFunctionDef.decorator_list;
@@ -2577,6 +2637,7 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     } else {
         assert(s->kind == FunctionDef_kind);
 
+        typeparams = s->v.FunctionDef.typeparams;
         args = s->v.FunctionDef.args;
         returns = s->v.FunctionDef.returns;
         decos = s->v.FunctionDef.decorator_list;
@@ -2600,6 +2661,12 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
     funcflags = compiler_default_arguments(c, args);
     if (funcflags == -1) {
         return 0;
+    }
+
+    if (typeparams) {
+        if (!compiler_add_typeparams(c, typeparams)) {
+            return 0;
+        }
     }
 
     annotations = compiler_visit_annotations(c, args, returns);
@@ -2637,6 +2704,12 @@ compiler_function(struct compiler *c, stmt_ty s, int is_async)
         Py_XDECREF(qualname);
         Py_XDECREF(co);
         return 0;
+    }
+
+    if (typeparams) {
+        if (!compiler_remove_typeparams(c, typeparams)) {
+            return 0;
+        }
     }
 
     if (!compiler_make_closure(c, co, funcflags, qualname)) {
@@ -2757,9 +2830,21 @@ compiler_class(struct compiler *c, stmt_ty s)
     ADDOP_LOAD_CONST(c, s->v.ClassDef.name);
 
     /* 5. generate the rest of the code for the call */
+    if (s->v.ClassDef.typeparams) {
+        if (!compiler_add_typeparams(c, s->v.ClassDef.typeparams)) {
+            return 0;
+        }
+    }
+
     if (!compiler_call_helper(c, 2, s->v.ClassDef.bases, 
             s->v.ClassDef.keywords, s->v.ClassDef.typeparams))
         return 0;
+
+    if (s->v.ClassDef.typeparams) {
+        if (!compiler_remove_typeparams(c, s->v.ClassDef.typeparams)) {
+            return 0;
+        }
+    }
 
     /* 6. apply decorators */
     if (!compiler_apply_decorators(c, decos))
@@ -4198,6 +4283,11 @@ compiler_nameop(struct compiler *c, identifier name, expr_context_ty ctx)
            !_PyUnicode_EqualToASCIIString(name, "True") &&
            !_PyUnicode_EqualToASCIIString(name, "False"));
 
+    if (c->u->u_ste->ste_typeparams && PySet_Contains(c->u->u_ste->ste_typeparams, name)) {
+        assert(ctx == Load);
+        return compiler_create_typeparam(c, name);
+    }
+
     if (forbidden_name(c, name, ctx))
         return 0;
 
@@ -4228,9 +4318,6 @@ compiler_nameop(struct compiler *c, identifier name, expr_context_ty ctx)
     case GLOBAL_EXPLICIT:
         optype = OP_GLOBAL;
         break;
-    case TYPEPARAM:
-        assert(ctx == Load);
-        return compiler_create_typeparam(c, name);
     default:
         /* scope can be 0 */
         break;
@@ -5088,6 +5175,11 @@ compiler_create_typevar_like(struct compiler *c, typeparam_ty t)
     // Call the constructor.
     ADDOP_LOAD_CONST(c, type_var_name);
     ADDOP_I(c, CALL, 1);
+
+    // If it's a TypeVarTuple, automatically unpack it.
+    if (t->kind == TypeVarTuple_kind) {
+        ADDOP_I(c, UNPACK_SEQUENCE, 1);
+    }
 
     return 1;
 }
@@ -6226,7 +6318,19 @@ compiler_typealias(struct compiler *c, stmt_ty s)
         return 0;
     }
 
+    if (s->v.TypeAlias.typeparams) {
+        if (!compiler_add_typeparams(c, s->v.TypeAlias.typeparams)) {
+            return 0;
+        }
+    }
+
     VISIT_IN_SCOPE(c, expr, s->v.TypeAlias.value);
+
+    if (s->v.TypeAlias.typeparams) {
+        if (!compiler_remove_typeparams(c, s->v.TypeAlias.typeparams)) {
+            return 0;
+        }
+    }
 
     ADDOP_I(c, SWAP, 2);
     ADDOP_NAME(c, STORE_ATTR, &_Py_ID(__value__), names);
