@@ -984,6 +984,9 @@ class TypeAliasType(_Final, _Immutable, _PickleUsingNameMixin, _root=True):
         copy.__arguments__ = args
         return copy
 
+    def __repr__(self):
+        return self.__name__
+
 
 class TypeParameter(_Final, _Immutable, _PickleUsingNameMixin, _root=True):
     """Type parameter.
