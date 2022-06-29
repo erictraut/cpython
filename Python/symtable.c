@@ -1265,6 +1265,8 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
             VISIT_QUIT(st, 0);
         if (s->v.FunctionDef.args->defaults)
             VISIT_SEQ(st, expr, s->v.FunctionDef.args->defaults);
+        if (s->v.FunctionDef.decorator_list)
+            VISIT_SEQ(st, expr, s->v.FunctionDef.decorator_list);
         if (s->v.FunctionDef.typeparams != NULL &&
             !symtable_enter_typeparam_block(st,
                 (void *)s->v.FunctionDef.typeparams)) {
@@ -1275,8 +1277,6 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
         if (!symtable_visit_annotations(st, s, s->v.FunctionDef.args,
                                         s->v.FunctionDef.returns))
             VISIT_QUIT(st, 0);
-        if (s->v.FunctionDef.decorator_list)
-            VISIT_SEQ(st, expr, s->v.FunctionDef.decorator_list);
         if (!symtable_enter_block(st, s->v.FunctionDef.name,
                                   FunctionBlock, (void *)s,
                                   LOCATION(s)))
@@ -1295,6 +1295,8 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
         PyObject *tmp;
         if (!symtable_add_def(st, s->v.ClassDef.name, DEF_LOCAL, LOCATION(s)))
             VISIT_QUIT(st, 0);
+        if (s->v.ClassDef.decorator_list)
+            VISIT_SEQ(st, expr, s->v.ClassDef.decorator_list);
         if (s->v.ClassDef.typeparams != NULL &&
             !symtable_enter_typeparam_block(st,
                     (void *)s->v.ClassDef.typeparams)) {
@@ -1302,8 +1304,6 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
         }
         VISIT_SEQ(st, expr, s->v.ClassDef.bases);
         VISIT_SEQ(st, keyword, s->v.ClassDef.keywords);
-        if (s->v.ClassDef.decorator_list)
-            VISIT_SEQ(st, expr, s->v.ClassDef.decorator_list);
         if (!symtable_enter_block(st, s->v.ClassDef.name, ClassBlock,
                                   (void *)s, s->lineno, s->col_offset,
                                   s->end_lineno, s->end_col_offset))
@@ -1555,6 +1555,8 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
             VISIT_QUIT(st, 0);
         if (s->v.AsyncFunctionDef.args->defaults)
             VISIT_SEQ(st, expr, s->v.AsyncFunctionDef.args->defaults);
+        if (s->v.AsyncFunctionDef.decorator_list)
+            VISIT_SEQ(st, expr, s->v.AsyncFunctionDef.decorator_list);
         if (s->v.AsyncFunctionDef.typeparams != NULL &&
             !symtable_enter_typeparam_block(st,
                 (void *)s->v.AsyncFunctionDef.typeparams)) {
@@ -1566,8 +1568,6 @@ symtable_visit_stmt(struct symtable *st, stmt_ty s)
         if (!symtable_visit_annotations(st, s, s->v.AsyncFunctionDef.args,
                                         s->v.AsyncFunctionDef.returns))
             VISIT_QUIT(st, 0);
-        if (s->v.AsyncFunctionDef.decorator_list)
-            VISIT_SEQ(st, expr, s->v.AsyncFunctionDef.decorator_list);
         if (!symtable_enter_block(st, s->v.AsyncFunctionDef.name,
                                   FunctionBlock, (void *)s,
                                   s->lineno, s->col_offset,
