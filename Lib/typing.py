@@ -56,7 +56,6 @@ __all__ = [
     'Protocol',
     'Tuple',
     'Type',
-    'TypeParameter',
     'TypeVar',
     'TypeVarTuple',
     'Union',
@@ -149,6 +148,8 @@ __all__ = [
     'TYPE_CHECKING',
     'TypeAlias',
     'TypeGuard',
+    'TypeParameter',
+    'TypeAliasType',
     'Unpack',
 ]
 

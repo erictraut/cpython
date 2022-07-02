@@ -5222,6 +5222,7 @@ compiler_call_helper(struct compiler *c,
                      asdl_typeparam_seq *typeparams)
 {
     Py_ssize_t i, nseen, nelts, nkwelts;
+    int has_typeparams = typeparams != NULL && asdl_seq_LEN(typeparams) > 0;
 
     if (validate_keywords(c, keywords) == -1) {
         return 0;
@@ -5252,7 +5253,7 @@ compiler_call_helper(struct compiler *c,
         assert(elt->kind != Starred_kind);
         VISIT(c, expr, elt);
     }
-    if (typeparams) {
+    if (has_typeparams) {
         if (!compiler_generate_generic_base_class(c, typeparams)) {
             return 0;
         }
@@ -5270,7 +5271,7 @@ compiler_call_helper(struct compiler *c,
 ex_call:
 
     /* Do positional arguments. */
-    if (n == 0 && nelts == 1 && !typeparams &&
+    if (n == 0 && nelts == 1 && !has_typeparams &&
             ((expr_ty)asdl_seq_GET(args, 0))->kind == Starred_kind) {
         VISIT(c, expr, ((expr_ty)asdl_seq_GET(args, 0))->v.Starred.value);
     }
@@ -5279,7 +5280,7 @@ ex_call:
                                  LIST_APPEND, LIST_EXTEND, 0) == 0) {
             return 0;
         }
-        if (typeparams) {
+        if (has_typeparams) {
             if (!compiler_generate_generic_base_class(c, typeparams)) {
                 return 0;
             }
