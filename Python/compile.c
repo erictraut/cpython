@@ -6443,7 +6443,7 @@ static int
 compiler_remove_typeparams(struct compiler *c, asdl_typeparam_seq *typeparams)
 {
     PySTEntryObject *ste = c->u->u_ste;
-    int i, n_params;
+    Py_ssize_t i, n_params;
     typeparam_ty t;
     identifier name;
 
