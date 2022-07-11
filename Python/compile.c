@@ -6447,11 +6447,11 @@ compiler_remove_typeparams(struct compiler *c, asdl_typeparam_seq *typeparams)
     typeparam_ty t;
     identifier name;
 
-    assert(ste->ste_typeparams);
-
     n_params = asdl_seq_LEN(typeparams);
 
     if (n_params > 0) {
+        assert(ste->ste_typeparams);
+
         // Note that all type parameter references should use
         // LOAD_TYPEVARS for accesses.
         c->u->u_local_type_variables = 0;

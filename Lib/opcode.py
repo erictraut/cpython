@@ -99,6 +99,8 @@ def_op('RETURN_VALUE', 83)
 def_op('IMPORT_STAR', 84)
 def_op('SETUP_ANNOTATIONS', 85)
 
+def_op('LOAD_TYPEVARS', 86)
+
 def_op('ASYNC_GEN_WRAP', 87)
 def_op('PREP_RERAISE_STAR', 88)
 def_op('POP_EXCEPT', 89)
@@ -197,8 +199,6 @@ jrel_op('POP_JUMP_BACKWARD_IF_NOT_NONE', 173)
 jrel_op('POP_JUMP_BACKWARD_IF_NONE', 174)
 jrel_op('POP_JUMP_BACKWARD_IF_FALSE', 175)
 jrel_op('POP_JUMP_BACKWARD_IF_TRUE', 176)
-
-def_op('LOAD_TYPEVARS', 177)
 
 
 del def_op, name_op, jrel_op, jabs_op
